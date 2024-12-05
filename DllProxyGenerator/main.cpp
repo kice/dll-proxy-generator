@@ -1,19 +1,20 @@
-#include <iostream>
 #include <Windows.h>
-#include <Commdlg.h>
-#include <String.h>
-#include <winnt.h>
 #include <imagehlp.h>
+#include <Commdlg.h>
+
+#include <iostream>
 #include <vector>
 #include <string>
 #include <fstream>
-#include <tchar.h>
 #include <stdio.h>
+
+#pragma comment (lib, "Dbghelp.lib")
+#pragma comment (lib, "Imagehlp.lib")
 
 using namespace std;
 
 // Check if its 32bit or 64bit
-WORD fileType;
+WORD fileType = IMAGE_FILE_MACHINE_I386;
 
 // Exported names
 vector<string> names;
@@ -101,9 +102,9 @@ void listDLLFunctions(string sADllName, vector<string> &slListOfDllFunctions)
 {
 	DWORD *dNameRVAs(0);
 	DWORD *dNameRVAs2(0);
-	_IMAGE_EXPORT_DIRECTORY *ImageExportDirectory;
+	IMAGE_EXPORT_DIRECTORY *ImageExportDirectory;
 	unsigned long cDirSize;
-	_LOADED_IMAGE LoadedImage;
+	LOADED_IMAGE LoadedImage;
 	string sName;
 	slListOfDllFunctions.clear();
 	if (MapAndLoad(sADllName.c_str(), NULL, &LoadedImage, TRUE, TRUE))
@@ -124,10 +125,10 @@ void listDLLFunctions(string sADllName, vector<string> &slListOfDllFunctions)
 	}
 }
 
-void generateDEF(string name, vector<string> names)
+void generateDEF(string output, string name, vector<string> names)
 {
 	std::fstream file;
-	file.open(name + ".def", std::ios::out);
+	file.open(output, std::ios::out);
 	file << "LIBRARY " << name << endl;
 	file << "EXPORTS" << endl;
 
@@ -140,118 +141,226 @@ void generateDEF(string name, vector<string> names)
 	file.close();
 }
 
-void generateMainCPP(string name, vector<string> names)
+void generateMainCPP(string output, string name, vector<string> names)
 {
 	size_t fileNameLength = name.size() + 6;
 	std::fstream file;
-	file.open(name + ".cpp", std::ios::out);
-	file << "#include <windows.h>" << endl
-		 << endl;
+	file.open(output, std::ios::out);
+	file << "#define WIN32_LEAN_AND_MEAN" << endl
+		<< "#include <windows.h>" << endl << endl
+		<< "namespace Proxy" << endl
+		<< "{" << endl
+		<< "void Init(HMODULE hProxy);" << endl
+		<< "}" << endl
+		<< endl;
 
-	file << "struct " << name << "_dll { \n"
-		 << "\tHMODULE dll;\n";
+	file << "struct " << name << "_dll" << endl
+		<< "{" << endl
+		<< "    HMODULE dll;"
+		<< endl;
 
-	for (int i = 0; i < names.size(); i++)
-	{
-		file << "\tFARPROC Orignal" << names[i] << ";\n";
+	for (const auto &fn : names) {
+		file << "    FARPROC Original" << fn << ";" << endl;
 	}
-	file << "} " << name << ";\n\n";
+	file << "} " << name << ";" << endl << endl;
 
-	// Generate Exports
-	if (fileType == IMAGE_FILE_MACHINE_AMD64) // 64bit
-	{
+	// Generate Functions
+	if (fileType == IMAGE_FILE_MACHINE_AMD64) {
+		// x86_64
 		file << "extern \"C\"" << endl
 			 << "{" << endl;
-		for (int i = 0; i < names.size(); i++)
-		{
-			file << "\tvoid Fake" << names[i] << "() { _asm { jmp[" << name << ".Orignal" << names[i] << "] } }\n";
+
+		for (const auto& fn : names) {
+			file << "\tvoid Fake" << fn << "() { __asm { jmp[" << name << ".Original" << fn << "] } }" << endl;
 		}
+
 		file << "}" << endl;
 	}
-	else
-	{ //x86
-		for (int i = 0; i < names.size(); i++)
-		{
-			file << "__declspec(naked) void Fake" << names[i] << "() { _asm { jmp[" << name << ".Orignal" << names[i] << "] } }\n";
+	else {
+		// x86
+		for (const auto& fn : names) {
+			file << "__declspec(naked) void Fake" << fn << "() { __asm { jmp[" << name << ".Original" << fn << "] } }" << endl;
 		}
 	}
 
-	file << "\n";
+	file << endl;
 
-	file << "BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {" << endl;
 
-	file << "\tchar path[MAX_PATH];" << std::endl;
-	file << "\tswitch (ul_reason_for_call)" << std::endl;
-	file << "\t{" << std::endl;
-	file << "\tcase DLL_PROCESS_ATTACH:" << std::endl;
-	file << "\t{" << std::endl;
-	file << "\t\tCopyMemory(path + GetSystemDirectory(path, MAX_PATH - " << fileNameLength << "), \"\\\\" << name << ".dll\", " << fileNameLength + 1 << ");" << std::endl;
-	file << "\t\t" << name << ".dll = LoadLibrary(path);" << std::endl;
-	file << "\t\tif (" << name << ".dll == false)" << std::endl;
-	file << "\t\t{" << std::endl;
-	file << "\t\t\tMessageBox(0, \"Cannot load original " << name << ".dll library\", \"Proxy\", MB_ICONERROR);" << std::endl;
-	file << "\t\t\tExitProcess(0);" << std::endl;
-	file << "\t\t}" << std::endl;
+	file << "namespace Proxy" << endl
+		<< "{" << endl
+		<< "void Init(HMODULE hProxy)" << endl
+		<< "{";
 
-	for (int i = 0; i < names.size(); i++)
-	{
-		file << "\t\t" << name << ".Orignal" << names[i] << " = GetProcAddress(" << name << ".dll, \"" << names[i] << "\");" << std::endl;
-	}
+    char buffer[1024]{ 0 };
+    sprintf_s(buffer,
+R"(
+    wchar_t realDllPath[MAX_PATH];
+    GetSystemDirectory(realDllPath, MAX_PATH);
+    wcscat_s(realDllPath, L"\\%s.dll");
+    auto OriginalModuleHandle = LoadLibrary(realDllPath);
+    if (OriginalModuleHandle == nullptr) {
+        MessageBox(nullptr, L"Cannot load original %s.dll library", L"Proxy", MB_ICONERROR);
+        ExitProcess(0);
+    }
 
-	file << "" << std::endl;
-	file << "\t\tbreak;" << std::endl;
-	file << "\t}" << std::endl;
-	file << "\tcase DLL_PROCESS_DETACH:" << std::endl;
-	file << "\t{" << std::endl;
-	file << "\t\tFreeLibrary(" << name << ".dll);" << std::endl;
-	file << "\t}" << std::endl;
-	file << "\tbreak;" << std::endl;
-	file << "\t}" << std::endl;
-	file << "\treturn TRUE;" << std::endl;
-	file << "}" << std::endl;
+#define RESOLVE(fn) %s.Original##fn = GetProcAddress(OriginalModuleHandle, #fn)
+)",
+name.c_str(), name.c_str(), name.c_str());
+
+	file << buffer << endl;
+
+    for (const auto& fn : names) {
+        file << "    RESOLVE(" << fn << ");" << endl;
+    }
+
+	file << "} // Proxy::Init" << endl
+		<< "} // namespace Proxy" << endl
+		<< endl;
 
 	file.close();
 }
 
 void generateASM(string name)
 {
-	std::fstream file;
-	file.open(name + ".asm", std::ios::out);
-	file << ".data" << endl;
-	file << "extern PA : qword" << endl;
-	file << ".code" << endl;
-	file << "RunASM proc" << endl;
-	file << "jmp qword ptr [PA]" << endl;
-	file << "RunASM endp" << endl;
-	file << "end" << endl;
+    std::fstream file;
+    file.open(name + ".asm", std::ios::out);
+    file << ".data" << endl;
+    file << "extern PA : qword" << endl;
+    file << ".code" << endl;
+    file << "RunASM proc" << endl;
+    file << "jmp qword ptr [PA]" << endl;
+    file << "RunASM endp" << endl;
+    file << "end" << endl;
 
+    file.close();
+}
+
+void generateProxyHeader(string output, string name, vector<string> names)
+{
+    std::fstream file;
+    file.open(output, std::ios::out);
+
+    file << "#define WIN32_LEAN_AND_MEAN" << endl
+        << "#include <windows.h>" << endl << endl
+		<< "class Proxy" << endl
+		<< "{" << endl
+        << R"(public:
+    static void Init(HMODULE hProxy);
+
+    static inline HMODULE ProxyModuleHandle{};
+    static inline HMODULE OriginalModuleHandle{};)" << endl
+        << endl;
+
+	size_t len = 4;
+	for (const auto& fn : names) {
+		len = len > fn.size() + 4 ? len : fn.size() + 4;
+	}
+
+    for (const auto& fn : names) {
+		std::string pad(len - fn.size(), ' ');
+        file << "    static inline decltype(" << fn << ")*" << pad << "Original" << fn << "{};" << endl;
+    }
+
+	file << "}; // Proxy" << endl;
+	file.close();
+}
+
+void generateProxy(string output, string name, vector<string> names)
+{
+	std::fstream file;
+	file.open(output, std::ios::out);
+
+	file << "#include \"Proxy.h\"" << endl << endl
+		<< "void Proxy::Init(HMODULE hProxy)" << endl
+		<< "{";
+
+	char buffer[1024]{ 0 };
+	sprintf_s(buffer, 
+R"(
+	ProxyModuleHandle = hProxy;
+
+    wchar_t realDllPath[MAX_PATH];
+    GetSystemDirectory(realDllPath, MAX_PATH);
+    wcscat_s(realDllPath, L"\\%s.dll");
+    OriginalModuleHandle = LoadLibrary(realDllPath);
+    if (OriginalModuleHandle == nullptr) {
+        MessageBox(nullptr, L"Cannot load original %s.dll library", L"Proxy", MB_ICONERROR);
+        ExitProcess(0);
+    }
+
+#define RESOLVE(fn) Original##fn = reinterpret_cast<decltype(Original##fn)>(GetProcAddress(OriginalModuleHandle, #fn)
+)",
+		name.c_str(), name.c_str());
+
+	file << buffer << endl;
+
+    size_t len = 1;
+    for (const auto& fn : names) {
+        len = len > fn.size() + 1 ? len : fn.size() + 1;
+    }
+
+	for (const auto& fn : names) {
+		file << "    RESOLVE(" << fn << ");" << endl;
+	}
+
+	file << "#undef RESOLVE" << endl 
+		<< "} // Proxy::Init" << endl
+		<< endl;
+	
+	for (const auto& fn : names) {
+		std::string pad(len - fn.size(), ' ');
+		file << "__declspec(naked) void Fake"<< fn << "()" << pad << "{ __asm { jmp[Proxy::Original" << fn << "] } }" << endl;
+	}
+
+	file << endl;
 	file.close();
 }
 
 int main(int argc, char *argv[])
 {
-	std::vector<std::string> args(argv, argv + argc);
-
-	IMAGE_NT_HEADERS headers;
-	if (getImageFileHeaders(args[1], headers))
-	{
-		fileType = headers.FileHeader.Machine;
+	if (argc < 2) {
+		cout << "[USAGE] DllProxyGenerator.exe <dll name>" << endl;
+		return 1;
 	}
 
-	// Get filename
-	vector<std::string> fileNameV = explode(args[1], '\\');
-	std::string fileName = fileNameV[fileNameV.size() - 1];
-	fileName = fileName.substr(0, fileName.size() - 4);
+	std::vector<std::string> args(argv, argv + argc);
+
+    // Get filename
+    vector<std::string> fileNameV = explode(args[1], '\\');
+    std::string fileName = fileNameV[fileNameV.size() - 1];
+    fileName = fileName.substr(0, fileName.size() - 4);
+
+	IMAGE_NT_HEADERS headers;
+	if (getImageFileHeaders(args[1], headers)) {
+		fileType = headers.FileHeader.Machine;
+	}
+	
+    cout << "\"" << fileName << ".dll\" is " << (fileType == IMAGE_FILE_MACHINE_AMD64 ? "64 bit" : "32 bit") << " executable file" << endl;
+
+	cout << "listing exports of \"" << fileName << ".dll\"" << endl;
 
 	// Get dll export names
 	listDLLFunctions(args[1], names);
 
-	// Create Def File
-	generateDEF(fileName, names);
-	generateMainCPP(fileName, names);
+	cout << "found " << names.size() << " function" << (names.size() > 1 ? "s" : "") << endl;
 
-	if (fileType == IMAGE_FILE_MACHINE_AMD64)
+	if (!CreateDirectoryA(fileName.c_str(), nullptr) && ERROR_ALREADY_EXISTS != GetLastError()) {
+		cout << "unable to create output directory: " << fileName << endl;
+		return 1;
+	}
+
+	cout << "exporting proxy to \".\\" << fileName << "\\\"" << endl;
+
+	// Create Def File
+	generateDEF(fileName + "\\exports.def", fileName, names);
+	generateMainCPP(fileName + "\\dllproxy.cpp", fileName, names);
+
+	generateProxyHeader(fileName + "\\Proxy.h", fileName, names);
+	generateProxy(fileName + "\\Proxy.cpp", fileName, names);
+
+	if (fileType == IMAGE_FILE_MACHINE_AMD64) {
 		generateASM(fileName);
+	}
 
 	return 0;
 }
